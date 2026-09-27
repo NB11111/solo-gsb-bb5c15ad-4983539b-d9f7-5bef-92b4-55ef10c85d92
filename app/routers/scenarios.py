@@ -374,6 +374,12 @@ async def delete_scenario(name: str, request: Request) -> JSONResponse:
     if store.current_revision(name) is None:
         return _not_found(name)
     if force:
+        # 先删引用 sessions 的幂等记录，再删事件与会话（foreign_keys=ON）
+        conn.execute(
+            "DELETE FROM idempotency_records WHERE token IN"
+            " (SELECT token FROM sessions WHERE scenario = ?)",
+            (name,),
+        )
         conn.execute("DELETE FROM events WHERE scenario = ?", (name,))
         conn.execute("DELETE FROM sessions WHERE scenario = ?", (name,))
         conn.commit()

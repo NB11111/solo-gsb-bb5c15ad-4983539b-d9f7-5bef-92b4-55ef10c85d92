@@ -49,5 +49,8 @@ class Scenario:
     states: list[str]
     routes: list[Route]
     timeouts: dict[str, StateTimeout] = field(default_factory=dict)
+    # 全部规则的 when 中声明过的 header 匹配字段（小写点路径）的并集；
+    # 会话级幂等回放的请求指纹只纳入这些场景声明的 header
+    header_match_fields: list[str] = field(default_factory=list)
     description: str = ""
     raw: dict[str, Any] = field(default_factory=dict)

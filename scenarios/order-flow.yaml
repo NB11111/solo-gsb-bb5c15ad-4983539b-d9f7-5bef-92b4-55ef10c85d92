@@ -208,3 +208,39 @@ routes:
           body:
             error: cancel_rejected
             detail: 当前状态 {{ state }} 不可取消
+
+  # 退款演示路由：when 中声明了 header 匹配字段 x-reason，
+  # 该字段会被纳入会话级幂等回放（sim-idempotency-key）的请求指纹；
+  # 未声明的请求头（如随机 trace 头）不参与指纹。
+  - id: refund-order
+    path: /orders/{order_id}/refund
+    methods: [POST]
+    rules:
+      - name: refund-with-reason
+        priority: 100
+        when:
+          - source: state
+            op: in
+            value: [paid, shipped, completed]
+          - source: header
+            path: x-reason
+            op: exists
+        response:
+          status: 200
+          headers:
+            Content-Type: application/json
+          body:
+            order_id: "{{ path.order_id }}"
+            refunded: true
+            reason: "{{ header['x-reason'] }}"
+        next_state: cancelled
+
+      - name: refund-without-reason
+        priority: 10
+        response:
+          status: 400
+          headers:
+            Content-Type: application/json
+          body:
+            error: refund_reason_required
+            detail: 退款请求必须携带 X-Reason 请求头

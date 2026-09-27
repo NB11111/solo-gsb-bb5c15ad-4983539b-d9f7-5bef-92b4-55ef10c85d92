@@ -48,6 +48,15 @@ YAML 场景，服务按**会话令牌**隔离每个调用方的当前状态，�
 `id` 即行 id，浏览器 `EventSource` 断连重连自动续传；空闲时发送心跳，非法游标
 返回 `422`。
 
+模拟业务请求支持**会话级幂等回放**：客户端在请求头携带
+`sim-idempotency-key: <key>` 后，首次成功命中规则时，服务会把由方法、路径、
+查询参数、请求体及**场景 `when` 中声明的 header 匹配字段**组成的请求指纹，
+与首次的状态码、响应头、响应体在现有 SQLite 写事务中随状态迁移和事件一并
+保存。同一 `token`/`key` 且指纹相同的重试**原样返回首次响应**，不再渲染、
+不再迁移状态、不再新增事件（也不消耗 `seq()`/seed 随机序列）；指纹不同
+返回 `409 idempotency_conflict`。重置或删除会话会清除该 token 的幂等记录，
+fork 出的新 token 不继承记录；不带 `sim-idempotency-key` 的请求行为完全不变。
+
 - 技术栈：Python 3.12 · FastAPI · SQLite（WAL）· Jinja2 沙箱模板 · PyYAML
 - 容器内启动即自动完成依赖安装与数据库初始化（含旧库就地升级），并自动加载 `scenarios/` 下的示例场景
 
@@ -119,6 +128,15 @@ curl -s -X POST $BASE/orders -H 'sim-session-token: t2' \
 curl -s -X POST $BASE/__sessions/t2/advance \
   -H 'Content-Type: application/json' -d '{"delta_ms":1800000}'
 # -> transitions: [{from: created, to: cancelled, at: 1800000, ...}]
+
+# 6) 会话级幂等回放：同一 sim-idempotency-key 的重试原样返回首次响应，
+#    不会重复下单；换请求体复用同一 key -> 409
+curl -s -X POST $BASE/orders -H 'sim-session-token: t3' \
+  -H 'sim-idempotency-key: order-001' -H 'Content-Type: application/json' \
+  -d '{"sku":"C-3","quantity":1}'
+curl -s -X POST $BASE/orders -H 'sim-session-token: t3' \
+  -H 'sim-idempotency-key: order-001' -H 'Content-Type: application/json' \
+  -d '{"sku":"C-3","quantity":1}'   # 与首次响应逐字节相同，无新事件
 ```
 
 每个模拟响应还带有调试响应头：
@@ -523,11 +541,11 @@ curl -s -X POST $BASE/__scenarios/analyze \
 | GET | `/__sessions/{token}` | **会话状态查询**：当前状态、绑定的 `revision`、`clock_ms`（虚拟时钟）、`timeout_at_ms`（当前状态超时到期时刻，无则 `null`）、`pending_timeout`（待触发超时与 `remaining_ms`）、上下文、随机序列摘要 `random`、可用状态、路由列表（按绑定版本给出） |
 | POST | `/__sessions/{token}/advance` | **虚拟时钟推进**：body `{"delta_ms": 1800000}`（非负整数），在单个写事务内按到期时刻连续结算状态超时，返回每步 `from`/`to`/`at` 与最终快照；零延迟超时环返回 409 并原子回滚 |
 | GET | `/__sessions/{token}/events?limit=50` | 最近的匹配与状态迁移历史（新→旧，含每次命中时的 `revision`；超时迁移记 `method=ADVANCE`、`route=@timeout`、`rule=timeout:<from>`） |
-| POST | `/__sessions/{token}/fork` | **会话快照分支**：单写事务内复制源会话绑定的 revision、state、context、seq、随机序列位置与虚拟时钟（clock_ms/timeout_at_ms）到新 token（可指定目标 token，冲突 409；源不存在 404；绑定版本已卸载 410）；事件历史不复制，分支后两条会话独立推进 |
+| POST | `/__sessions/{token}/fork` | **会话快照分支**：单写事务内复制源会话绑定的 revision、state、context、seq、随机序列位置与虚拟时钟（clock_ms/timeout_at_ms）到新 token（可指定目标 token，冲突 409；源不存在 404；绑定版本已卸载 410）；事件历史与**幂等记录均不复制**，分支后两条会话独立推进 |
 | POST | `/__sessions/{token}/preview` | **请求预演**：不落库地试运行一次业务请求，返回拟响应与 state/context 差异（按会话绑定的 revision 执行） |
 | POST | `/__sessions/{token}/preview/chain` | **连续请求链预演**：有序请求数组基于同一会话快照依次试跑（最多 50 步），逐步返回命中/拟响应/差异与最终快照，不落库 |
-| POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态、虚拟时钟归零并清空事件；不改变会话绑定的 revision；可传 `"seed"` 让随机序列从头初始化 |
-| DELETE | `/__sessions/{token}` | 删除会话及其事件 |
+| POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态、虚拟时钟归零并清空事件与该 token 的**幂等回放记录**；不改变会话绑定的 revision；可传 `"seed"` 让随机序列从头初始化 |
+| DELETE | `/__sessions/{token}` | 删除会话及其事件与幂等回放记录 |
 
 #### 可复现随机序列（seed）
 
@@ -589,6 +607,9 @@ seed 随机序列位置（`_rng`）以及**虚拟时钟**（`clock_ms` 与当前
   返回 `410 scenario_unloaded`；
 - **事件历史不复制**：新会话的 `events` 从空开始；分支后两条会话各自独立
   推进，互不影响（各自的状态迁移、`seq()` 与随机序列都只写自己的行）；
+- **幂等记录不复制**：源 token 的 `sim-idempotency-key` 记录不会带过来，
+  新 token 使用相同的 key 会按首次请求重新执行（两个 token 互不构成
+  指纹冲突）；
 - 响应为 `201`，返回源/目标标识（`source_token` / `token`）与快照摘要
   （`scenario` / `revision` / `state` / `context` / `random`），
   `events_copied` 恒为 `false`。
@@ -914,8 +935,77 @@ curl -s -X POST $BASE/__sessions/c1/preview/chain \
 
 - 会话令牌：请求头 `sim-session-token: <token>`（也支持 `?sim_session_token=`）。
 - 可选请求头 `sim-scenario: <name>`：仅新会话首次请求时用于绑定场景。
+- 可选请求头 `sim-idempotency-key: <key>`：启用**会话级幂等回放**（见下节）。
 - 请求体：`application/json` 按 JSON 解析；`application/x-www-form-urlencoded`
   按表单解析；YAML 的 content-type 按 YAML 解析；其他文本保存为 `body._raw`。
+
+### 会话级幂等回放（sim-idempotency-key）
+
+网络超时、客户端重试时，同一笔业务请求可能被送达多次。在业务请求头携带
+`sim-idempotency-key`（取值由客户端生成，建议 UUID/随机串；作用域为**当前
+会话 token**）即可获得“同一笔请求只生效一次”的保证：
+
+- **首次请求**：成功命中规则（含规则返回 4xx 兜底响应）时，在完成匹配→渲染→
+  状态迁移的**同一个 SQLite 写事务**中，把请求指纹与首次响应（状态码、响应头、
+  响应体）连同事件一起写入 `idempotency_records` 表；
+- **相同重试**（同 `token` + 同 `key` + 同指纹）：直接返回缓存的首次响应
+  （`X-Sim-Matched` / `X-Sim-Revision` / `X-Sim-State` 调试头与首次一致），
+  **不再渲染模板、不迁移状态、不写事件**，因此 `seq()` 计数与 seed 随机序列
+  也不会被重复消耗；回放不执行规则的 `delay_ms`；
+- **冲突重试**（同 `token` + 同 `key` 但指纹不同）：返回
+  `409 {"error":"idempotency_conflict", ...}`，并在 `original` 中给出首次请求的
+  方法与路径；本次请求不产生任何副作用；
+- **指纹范围**：HTTP 方法、路径、全部查询参数、完整请求体，以及**场景在规则
+  `when` 中声明过的 header 匹配字段**（`source: header` 的字段并集，键名小写）
+  的实际取值；未在场景中声明的请求头（包括 `sim-idempotency-key` 自身与
+  `Content-Type` 等）不参与指纹，缺失的声明字段记为 `null`；
+- **生命周期**：`POST /__sessions/{token}/reset` 与
+  `DELETE /__sessions/{token}` 都会清除该 token 的全部幂等记录（重置后同一
+  key 可重新建立）；`fork` 创建的新 token **不继承**源 token 的记录，两边
+  各自独立；场景 `?force=true` 级联删除时一并清理；
+- **不缓存的响应**：路由不存在（404）、方法不允许（405）、无规则命中
+  （409 `no_matching_rule`）、渲染失败（500）等**未成功命中规则**的请求不落
+  幂等记录，客户端可原样安全重试；
+- 不带 `sim-idempotency-key`（或值为空白）的请求完全沿用原有行为。
+
+```bash
+BASE=http://localhost:8080
+
+# 首次请求：携带幂等键，201，状态 init -> created
+curl -s -X POST $BASE/orders \
+  -H 'sim-session-token: t1' \
+  -H 'sim-idempotency-key: 7e8f6c1a-2b3d-4e5f-9a01' \
+  -H 'Content-Type: application/json' \
+  -d '{"sku":"A-1","quantity":2}'
+
+# 网络超时后原样重试（同 token/key/指纹）：返回与首次完全相同的响应，
+# 不会重复下单、不新增事件、不重复消耗 seq()
+curl -s -X POST $BASE/orders \
+  -H 'sim-session-token: t1' \
+  -H 'sim-idempotency-key: 7e8f6c1a-2b3d-4e5f-9a01' \
+  -H 'Content-Type: application/json' \
+  -d '{"sku":"A-1","quantity":2}'
+
+# 误用同一个 key 发送了不同请求（请求体不同）-> 409
+curl -i -X POST $BASE/orders \
+  -H 'sim-session-token: t1' \
+  -H 'sim-idempotency-key: 7e8f6c1a-2b3d-4e5f-9a01' \
+  -H 'Content-Type: application/json' \
+  -d '{"sku":"B-2","quantity":1}'
+# -> 409 {"error":"idempotency_conflict",
+#         "original":{"method":"POST","path":"/orders"}, ...}
+
+# 声明了 header 匹配字段的路由：order-flow 的退款路由要求 X-Reason，
+# 该头进入指纹；未声明的额外请求头（如 X-Trace）变化不影响回放
+curl -s -X POST $BASE/orders/1000/refund \
+  -H 'sim-session-token: t1' -H 'sim-idempotency-key: refund-1' \
+  -H 'X-Reason: goods-damaged'
+# X-Reason 改成别的值再用 refund-1 重试 -> 409 idempotency_conflict
+```
+
+> 幂等记录以 `(token, idempotency_key)` 为主键，全部读写都在
+> `BEGIN IMMEDIATE` 写事务内完成：同一会话同一 key 的并发请求由 SQLite 写锁
+> 串行化，恰好一个请求真正执行，其余得到首次响应的回放。
 
 ### 会话事件订阅（SSE）
 
@@ -1001,6 +1091,11 @@ es.onmessage = (ev) => {
 4. 渲染响应、计算 `set` 与 `next_state`；
 5. 更新会话并写入一条 `events` 记录，然后提交。
 
+携带 `sim-idempotency-key` 时，幂等记录的查重（回放/409）与首次写入也都在
+上述事务的第 2 步之后、同一次提交内完成：同一 token/key 的并发重试被写锁
+串行化，恰好一个请求真正渲染并迁移，其余请求在同一锁队列里读到已提交的
+首次响应并原样回放，不会出现两个请求都当作“首次”执行的情况。
+
 拿不到锁时按 `SIM_BUSY_TIMEOUT_MS` 等待并在应用层重试（`SIM_DB_RETRIES` 次）。
 因此同一会话的并发请求会被**串行化**，每个请求看到的都是前一个请求提交后的新状态：
 例如 20 个并发支付请求中恰好 1 个得到 200 并完成 `created -> paid`，
@@ -1042,13 +1137,13 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 ├── app/
 │   ├── main.py            # FastAPI 入口、生命周期初始化、全路径转发
 │   ├── config.py          # 环境变量配置
-│   ├── db.py              # 连接/WAL/建表/旧库迁移/IMMEDIATE 写事务（含只读回滚事务）与锁重试
-│   ├── scenario.py        # YAML 解析与校验（含状态超时 after_ms/next_state/set）
+│   ├── db.py              # 连接/WAL/建表（含 idempotency_records）/旧库迁移/IMMEDIATE 写事务（含只读回滚事务）与锁重试
+│   ├── scenario.py        # YAML 解析与校验（含状态超时 after_ms/next_state/set、header 匹配字段收集）
 │   ├── analysis.py        # 状态可达性静态诊断：规则 next_state + 超时迁移建图，BFS 求不可达状态/无法触发规则/最短路径
 │   ├── models.py          # 场景/路由/规则/状态超时数据模型
 │   ├── matching.py        # 路径模式、点路径取值、条件运算符
 │   ├── renderer.py        # Jinja2 沙箱渲染、模板函数与会话级确定性随机源（seed）
-│   ├── engine.py          # 核心：单事务匹配→渲染→迁移；虚拟时钟 advance 超时连续结算；同快照只读预演（零副作用）；两 revision 纯内存版本回归对比
+│   ├── engine.py          # 核心：单事务匹配→渲染→迁移；会话级幂等回放（指纹查重/409/首次记录随事务落库）；虚拟时钟 advance 超时连续结算；同快照只读预演（零副作用）；两 revision 纯内存版本回归对比
 │   ├── event_bus.py       # 进程内事件总线：写事务提交后唤醒 SSE 订阅者（单 worker 权威）
 │   ├── store.py           # 已编译场景缓存（按 name+revision）、发布/激活
 │   └── routers/
@@ -1068,10 +1163,15 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 revision/状态/上下文/虚拟时钟 `clock_ms`/当前状态超时到期时刻 `timeout_at_ms`；
 上下文内含 `_seq` 计数器与 `_rng` 随机序列状态）、
 `events`（每次命中的 revision、路由、规则、前后状态与状态码；超时迁移记为
-`method=ADVANCE`、`route=@timeout`、`rule=timeout:<from>`、`status_code=NULL`）。
+`method=ADVANCE`、`route=@timeout`、`rule=timeout:<from>`、`status_code=NULL`）、
+`idempotency_records`（会话级幂等回放：`(token, idempotency_key)` 主键，
+保存请求指纹 `fingerprint`、首次请求的方法/路径与完整响应——状态码/响应头/
+响应体/`is_json`、命中信息与创建时间；随首次成功命中在同一写事务落库，
+reset/删除会话时按 token 清除，fork 的新 token 不继承）。
 启动时自动检测并就地升级旧版表结构：旧定义固化为 revision 1，既有会话回填绑定
 该版本、虚拟时钟归零，历史事件的 revision 置空。随机序列状态存于上下文 JSON
-内部，无需表结构变更，既有会话不受影响。
+内部，无需表结构变更，既有会话不受影响；`idempotency_records` 为
+`CREATE TABLE IF NOT EXISTS` 新表，旧库启动时自动创建，历史会话行为不变。
 
 ---
 

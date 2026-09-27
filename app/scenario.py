@@ -244,12 +244,22 @@ def parse_scenario(text: str, *, name_override: str | None = None) -> Scenario:
     _validate_templates(routes, initial_state)
     _validate_timeout_templates(timeouts)
 
+    # 收集场景所有规则 when 条件中声明过的 header 匹配字段（归一化为小写）；
+    # 供会话级幂等回放构造请求指纹使用
+    header_match_fields: set[str] = set()
+    for route in routes:
+        for rule in route.rules:
+            for cond in rule.conditions:
+                if cond.source == "header":
+                    header_match_fields.add(cond.path.lower())
+
     return Scenario(
         name=name,
         initial_state=initial_state,
         states=states,
         routes=routes,
         timeouts=timeouts,
+        header_match_fields=sorted(header_match_fields),
         description=str(data.get("description", "")),
         raw=data,
     )

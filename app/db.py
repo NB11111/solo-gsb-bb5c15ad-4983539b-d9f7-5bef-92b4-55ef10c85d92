@@ -63,6 +63,26 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_token ON events(token, id);
+
+-- 会话级幂等回放：客户端用 sim-idempotency-key 请求头声明幂等键，
+-- 首次成功命中规则时把请求指纹与首次响应随状态迁移、事件在同一写事务中保存；
+-- 同一 token/key 的重试按指纹回放（指纹不同返回 409）。
+-- reset/删除会话时按 token 清除；fork 出新 token 不继承记录（新表无外键行）。
+CREATE TABLE IF NOT EXISTS idempotency_records (
+    token          TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    fingerprint    TEXT NOT NULL,
+    method         TEXT NOT NULL,
+    path           TEXT NOT NULL,
+    status_code    INTEGER NOT NULL,
+    headers        TEXT NOT NULL,
+    body           TEXT,
+    is_json        INTEGER NOT NULL DEFAULT 0,
+    matched        TEXT NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (token, idempotency_key),
+    FOREIGN KEY (token) REFERENCES sessions(token)
+);
 """
 
 _local = threading.local()

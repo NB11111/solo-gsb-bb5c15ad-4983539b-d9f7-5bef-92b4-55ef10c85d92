@@ -53,6 +53,7 @@ class SimResult:
     delay_ms: int
     is_json: bool
     matched: dict[str, Any]
+    replayed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +359,62 @@ def _timeout_due_at(scenario: Scenario, state: str, entered_at_ms: int) -> int |
 
 
 # ---------------------------------------------------------------------------
+# 会话级幂等回放（sim-idempotency-key）
+# ---------------------------------------------------------------------------
+
+IDEMPOTENCY_HEADER = "sim-idempotency-key"
+
+
+def _canonical_json(value: Any) -> str:
+    """稳定的规范 JSON 文本：键排序、紧凑分隔、保留 Unicode，作为指纹/比对载体。"""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+
+
+def _request_fingerprint(scenario: Scenario, *, method: str, path: str,
+                         query: dict[str, Any], headers: dict[str, Any],
+                         body: Any) -> str:
+    """构造幂等请求指纹。
+
+    指纹 = 方法、路径、查询参数、请求体，以及**场景声明的 header 匹配字段**
+    （所有规则 ``when`` 中 ``source: header`` 的字段并集，小写点路径）的实际
+    取值；未声明的 header（含 sim-idempotency-key 自身、随机 trace 头等）不
+    参与指纹，缺失的声明字段记为 null。
+    """
+    matched_headers = {
+        field_name: headers.get(field_name)
+        for field_name in scenario.header_match_fields
+    }
+    envelope = {
+        "method": method,
+        "path": path,
+        "query": query,
+        "header": matched_headers,
+        "body": body,
+    }
+    return _canonical_json(envelope)
+
+
+def _replay_result(row: sqlite3.Row) -> SimResult:
+    """把幂等记录行还原为首次响应（不再渲染、迁移或新增事件）。"""
+    body_text = row["body"]
+    if not row["is_json"]:
+        # 字符串/无响应体：NULL 表示无 body；其余按原文本返回
+        body = None if body_text is None else body_text
+    else:
+        body = json.loads(body_text)
+    return SimResult(
+        status_code=int(row["status_code"]),
+        headers=json.loads(row["headers"]),
+        body=body,
+        delay_ms=0,  # 回放不再模拟延迟
+        is_json=bool(row["is_json"]),
+        matched=json.loads(row["matched"]),
+        replayed=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 真实请求主入口
 # ---------------------------------------------------------------------------
 
@@ -376,21 +433,45 @@ async def simulate(request, default_scenario: str | None = None) -> SimResult:
     body = await _read_body(request)
     # 新会话首次请求时可用 sim-scenario 头指定场景；已有会话忽略
     explicit_scenario = request.headers.get("sim-scenario")
+    # 会话级幂等键：存在（非空白）即启用幂等回放；未提供则沿用原行为
+    idem_key = (headers.get(IDEMPOTENCY_HEADER) or "").strip() or None
 
     with write_tx() as conn:
         result = _run_locked(conn, token, method, path, query, headers, body,
-                             default_scenario, explicit_scenario)
+                             default_scenario, explicit_scenario, idem_key)
     # 事务已提交：唤醒事件流订阅者，让它们立刻读到新事件（回滚路径不发）
     event_bus.publish()
     return result
 
 
 def _run_locked(conn, token, method, path, query, headers, body,
-                default_scenario, explicit_scenario) -> SimResult:
+                default_scenario, explicit_scenario,
+                idempotency_key) -> SimResult:
     # 1) 查找会话与场景（不存在则按懒创建规则选场景，暂不落库）
     (scenario, scenario_name, revision, state, context, clock_ms, timeout_at_ms,
      is_new_session) = _resolve_snapshot(
         conn, token, explicit_scenario, default_scenario)
+
+    # 1.5) 会话级幂等：同 token/key 的重试在渲染/迁移/写事件之前处理。
+    #      指纹相同 -> 原样回放首次响应；指纹不同 -> 409（本事务回滚，无副作用）。
+    if idempotency_key is not None:
+        idem_row = conn.execute(
+            "SELECT fingerprint, method, path, status_code, headers, body, is_json,"
+            " matched FROM idempotency_records WHERE token = ? AND idempotency_key = ?",
+            (token, idempotency_key),
+        ).fetchone()
+        if idem_row is not None:
+            fingerprint = _request_fingerprint(
+                scenario, method=method, path=path, query=query,
+                headers=headers, body=body)
+            if idem_row["fingerprint"] != fingerprint:
+                raise SimAbort(409, {
+                    "error": "idempotency_conflict",
+                    "detail": "同一 sim-idempotency-key 的请求指纹与首次请求不一致",
+                    "idempotency_key": idempotency_key,
+                    "original": {"method": idem_row["method"], "path": idem_row["path"]},
+                })
+            return _replay_result(idem_row)
 
     # 2) 匹配路由（不存在则回滚，不留下空会话）
     route, path_params, _trace = _match_routes(scenario, method, path)
@@ -450,20 +531,42 @@ def _run_locked(conn, token, method, path, query, headers, body,
          state, planned.next_state, planned.status_code),
     )
 
+    matched_info = {
+        "scenario": scenario_name,
+        "revision": revision,
+        "route": route.id,
+        "rule": rule.name,
+        "from_state": state,
+        "to_state": planned.next_state,
+    }
+
+    if idempotency_key is not None:
+        # 幂等键：首次成功命中规则时，把请求指纹与完整首次响应随状态迁移和
+        # 事件在同一写事务中一并保存（任何失败都会随事务回滚，不会留下记录）
+        conn.execute(
+            """
+            INSERT INTO idempotency_records(token, idempotency_key, fingerprint,
+                                           method, path, status_code, headers,
+                                           body, is_json, matched)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (token, idempotency_key,
+             _request_fingerprint(scenario, method=method, path=path, query=query,
+                                  headers=headers, body=body),
+             method, path, planned.status_code,
+             dumps(planned.headers),
+             None if planned.body is None else dumps(planned.body),
+             1 if planned.is_json else 0,
+             dumps(matched_info)),
+        )
+
     return SimResult(
         status_code=planned.status_code,
         headers=planned.headers,
         body=planned.body,
         delay_ms=planned.delay_ms,
         is_json=planned.is_json,
-        matched={
-            "scenario": scenario_name,
-            "revision": revision,
-            "route": route.id,
-            "rule": rule.name,
-            "from_state": state,
-            "to_state": planned.next_state,
-        },
+        matched=matched_info,
     )
 
 

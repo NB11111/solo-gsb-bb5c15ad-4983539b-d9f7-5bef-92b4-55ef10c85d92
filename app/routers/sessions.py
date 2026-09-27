@@ -432,6 +432,8 @@ async def reset_session(token: str, body: ResetBody) -> JSONResponse:
             (state, dumps(context), timeout_at_ms, token),
         )
         conn.execute("DELETE FROM events WHERE token = ?", (token,))
+        # 重置即清除该 token 的全部幂等记录（同一 key 在重置后按首次请求重新建立）
+        conn.execute("DELETE FROM idempotency_records WHERE token = ?", (token,))
     return JSONResponse(_serialize(_session_row(token)))
 
 
@@ -439,6 +441,8 @@ async def reset_session(token: str, body: ResetBody) -> JSONResponse:
 async def delete_session(token: str) -> JSONResponse:
     with write_tx() as conn:
         cur = conn.execute("DELETE FROM events WHERE token = ?", (token,))
+        # 删除会话时一并清除该 token 的幂等记录
+        conn.execute("DELETE FROM idempotency_records WHERE token = ?", (token,))
         cur2 = conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
     if cur2.rowcount == 0:
         return JSONResponse(status_code=404, content={"error": "session_not_found", "token": token})
