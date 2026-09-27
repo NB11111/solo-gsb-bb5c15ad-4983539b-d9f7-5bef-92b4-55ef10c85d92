@@ -16,6 +16,11 @@ state/context 差异；请求链预演（``preview_chain``）从同一快照出�
 任一侧单步失败只记录该侧结果、该侧快照保持本步之前的值，不影响另一侧与
 后续步骤。整个对比过程不触碰数据库：不写 sessions/events，也不持久化任何
 seq 计数或随机状态。
+
+业务请求还可携带 ``sim-idempotency-key`` 做**会话级幂等回放**：首个成功命中
+规则的请求，其指纹（方法/路径/查询参数/请求体/场景声明的 header 匹配字段）
+与响应随状态迁移在同一写事务落库；同 token/key 的重试指纹相同则直接返回
+首个响应（不渲染、不迁移、不新增事件），不同则返回 409。
 """
 from __future__ import annotations
 
@@ -27,7 +32,7 @@ from urllib.parse import parse_qsl
 
 from .db import dumps, read_tx, write_tx
 from .event_bus import event_bus
-from .matching import evaluate_condition, get_condition_value, match_path
+from .matching import evaluate_condition, get_condition_value, match_path, resolve
 from .models import Route, Rule, Scenario
 from .renderer import RenderError, Renderer, SessionRNG
 from .store import store
@@ -53,6 +58,7 @@ class SimResult:
     delay_ms: int
     is_json: bool
     matched: dict[str, Any]
+    replayed: bool = False  # True 表示幂等回放：未渲染/未迁移/未写事件的首响应副本
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +364,107 @@ def _timeout_due_at(scenario: Scenario, state: str, entered_at_ms: int) -> int |
 
 
 # ---------------------------------------------------------------------------
+# 会话级幂等回放（sim-idempotency-key）
+#
+# 首个携带 key 且成功命中规则的请求，在同一写事务中把「请求指纹 + 首个响应」
+# 随状态迁移与事件一并落库；同 token/key 的重试按指纹比对：相同直接返回首个
+# 响应（不再渲染、不迁移、不新增事件），不同返回 409。指纹由方法、路径、
+# 查询参数、请求体与场景 when 条件中声明的 header 匹配字段构成——未声明的
+# 请求头（如追踪头）不影响指纹。
+# ---------------------------------------------------------------------------
+
+def _canonical_dumps(value: Any) -> str:
+    """指纹用 JSON 序列化：键排序，与请求头/查询参数的书写顺序无关。"""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _declared_header_paths(scenario: Scenario) -> list[str]:
+    """场景全部规则的 when 条件中 source=header 的取值路径（排序去重）。"""
+    paths: set[str] = set()
+    for route in scenario.routes:
+        for rule in route.rules:
+            for cond in rule.conditions:
+                if cond.source == "header":
+                    paths.add(cond.path)
+    return sorted(paths)
+
+
+def _request_fingerprint(scenario: Scenario, method: str, path: str,
+                         query: dict[str, Any], headers: dict[str, Any],
+                         body: Any) -> str:
+    """请求指纹：方法/路径/查询参数/请求体 + 场景声明的 header 匹配字段取值。
+
+    header 取值复用与条件判定相同的 resolve 语义（缺失记为 None），因此
+    「影响匹配的请求成分」与「参与指纹的请求成分」完全一致。
+    """
+    declared: dict[str, Any] = {}
+    for header_path in _declared_header_paths(scenario):
+        present, value = resolve(headers, header_path)
+        declared[header_path] = value if present else None
+    return _canonical_dumps({
+        "method": method,
+        "path": path,
+        "query": query,
+        "body": body,
+        "headers": declared,
+    })
+
+
+def _lookup_idempotency(conn, token: str, key: str,
+                        fingerprint: str) -> SimResult | None:
+    """查找 (token, key) 的首个响应；无记录返回 None，指纹不同抛 409。"""
+    row = conn.execute(
+        "SELECT fingerprint, status_code, resp_headers, resp_body, is_json, matched"
+        " FROM idempotency_keys WHERE token = ? AND idem_key = ?",
+        (token, key),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["fingerprint"] != fingerprint:
+        raise SimAbort(409, {
+            "error": "idempotency_key_conflict",
+            "detail": "同一 sim-idempotency-key 对应了不同的请求指纹；"
+                      "请更换 key，或重置会话清除旧记录后重试",
+            "token": token,
+            "idempotency_key": key,
+        })
+    return SimResult(
+        status_code=row["status_code"],
+        headers=json.loads(row["resp_headers"]),
+        body=json.loads(row["resp_body"]) if row["resp_body"] is not None else None,
+        delay_ms=0,  # 回放不重新施加模拟延迟
+        is_json=bool(row["is_json"]),
+        matched=json.loads(row["matched"]),
+        replayed=True,
+    )
+
+
+def _save_idempotency(conn, token: str, key: str, fingerprint: str,
+                      planned: _Planned, revision: int) -> None:
+    """把首个响应随状态迁移与事件在同一写事务中落库（调用方保证规则已命中）。"""
+    matched = {
+        "scenario": planned.scenario_name,
+        "revision": revision,
+        "route": planned.route.id,
+        "rule": planned.rule.name,
+        "from_state": planned.state,
+        "to_state": planned.next_state,
+    }
+    conn.execute(
+        """
+        INSERT INTO idempotency_keys(token, idem_key, fingerprint, status_code,
+                                     resp_headers, resp_body, is_json, matched)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (token, key, fingerprint, planned.status_code,
+         dumps(planned.headers),
+         dumps(planned.body) if planned.body is not None else None,
+         1 if planned.is_json else 0,
+         dumps(matched)),
+    )
+
+
+# ---------------------------------------------------------------------------
 # 真实请求主入口
 # ---------------------------------------------------------------------------
 
@@ -376,21 +483,38 @@ async def simulate(request, default_scenario: str | None = None) -> SimResult:
     body = await _read_body(request)
     # 新会话首次请求时可用 sim-scenario 头指定场景；已有会话忽略
     explicit_scenario = request.headers.get("sim-scenario")
+    # 可选幂等键：携带后同 token/key 的重试按请求指纹回放首个响应
+    idempotency_key = request.headers.get("sim-idempotency-key")
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip() or None
 
     with write_tx() as conn:
         result = _run_locked(conn, token, method, path, query, headers, body,
-                             default_scenario, explicit_scenario)
-    # 事务已提交：唤醒事件流订阅者，让它们立刻读到新事件（回滚路径不发）
-    event_bus.publish()
+                             default_scenario, explicit_scenario, idempotency_key)
+    # 事务已提交：唤醒事件流订阅者，让它们立刻读到新事件
+    # （回滚路径不发；幂等回放没有产生新事件，同样不发）
+    if not result.replayed:
+        event_bus.publish()
     return result
 
 
 def _run_locked(conn, token, method, path, query, headers, body,
-                default_scenario, explicit_scenario) -> SimResult:
+                default_scenario, explicit_scenario,
+                idempotency_key: str | None = None) -> SimResult:
     # 1) 查找会话与场景（不存在则按懒创建规则选场景，暂不落库）
     (scenario, scenario_name, revision, state, context, clock_ms, timeout_at_ms,
      is_new_session) = _resolve_snapshot(
         conn, token, explicit_scenario, default_scenario)
+
+    # 1.5) 幂等回放：同 token/key 且指纹相同 -> 直接返回首个响应，
+    #      不再渲染、不迁移、不新增事件；指纹不同 -> 409（回滚，无副作用）
+    fingerprint: str | None = None
+    if idempotency_key is not None:
+        fingerprint = _request_fingerprint(scenario, method, path, query,
+                                           headers, body)
+        replay = _lookup_idempotency(conn, token, idempotency_key, fingerprint)
+        if replay is not None:
+            return replay
 
     # 2) 匹配路由（不存在则回滚，不留下空会话）
     route, path_params, _trace = _match_routes(scenario, method, path)
@@ -449,6 +573,10 @@ def _run_locked(conn, token, method, path, query, headers, body,
         (token, scenario_name, revision, method, path, route.id, rule.name,
          state, planned.next_state, planned.status_code),
     )
+    # 幂等键：首个成功命中的请求指纹与响应随状态迁移、事件在同一写事务落库
+    if idempotency_key is not None and fingerprint is not None:
+        _save_idempotency(conn, token, idempotency_key, fingerprint,
+                          planned, revision)
 
     return SimResult(
         status_code=planned.status_code,

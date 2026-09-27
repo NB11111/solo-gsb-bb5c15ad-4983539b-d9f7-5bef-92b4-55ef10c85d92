@@ -63,6 +63,22 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_token ON events(token, id);
+
+-- 会话级幂等回放：首个成功命中的请求指纹与响应随状态迁移在同一写事务落库；
+-- 同 token/key 的重试按指纹比对，相同直接回放首个响应，不同返回 409。
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    token        TEXT NOT NULL,
+    idem_key     TEXT NOT NULL,
+    fingerprint  TEXT NOT NULL,
+    status_code  INTEGER NOT NULL,
+    resp_headers TEXT NOT NULL,
+    resp_body    TEXT,
+    is_json      INTEGER NOT NULL DEFAULT 0,
+    matched      TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (token, idem_key),
+    FOREIGN KEY (token) REFERENCES sessions(token)
+);
 """
 
 _local = threading.local()

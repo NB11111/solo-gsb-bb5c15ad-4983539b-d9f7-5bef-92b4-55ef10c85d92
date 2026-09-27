@@ -147,7 +147,8 @@ async def fork_session(token: str, body: ForkBody | None = None) -> JSONResponse
     完整复制绑定的 scenario revision、state、业务 context、`_seq` 计数器、
     seed 随机序列位置（`_rng`）与虚拟时钟（`clock_ms`/`timeout_at_ms`）：
     分支后首个相同请求（含 advance）得到与源会话同快照一致的结果。
-    事件历史不复制，分支后两条会话各自独立推进。
+    事件历史与幂等回放记录（`sim-idempotency-key`）都不复制，
+    分支后两条会话各自独立推进。
     """
     new_token = (body.token if body else None) or f"sess-{secrets.token_hex(12)}"
 
@@ -191,8 +192,10 @@ async def fork_session(token: str, body: ForkBody | None = None) -> JSONResponse
         "source_token": token,
         **_serialize(_session_row(new_token)),
         "events_copied": False,
+        "idempotency_copied": False,
         "detail": "已复制绑定的 scenario revision、state、业务 context、seq 计数、"
-                  "随机序列位置与虚拟时钟；事件历史不复制，分支后两条会话独立推进",
+                  "随机序列位置与虚拟时钟；事件历史与幂等回放记录不复制，"
+                  "分支后两条会话独立推进",
     }
     return JSONResponse(status_code=201, content=result)
 
@@ -432,13 +435,16 @@ async def reset_session(token: str, body: ResetBody) -> JSONResponse:
             (state, dumps(context), timeout_at_ms, token),
         )
         conn.execute("DELETE FROM events WHERE token = ?", (token,))
+        # 幂等回放记录一并清除：重置后同一 sim-idempotency-key 重新执行
+        conn.execute("DELETE FROM idempotency_keys WHERE token = ?", (token,))
     return JSONResponse(_serialize(_session_row(token)))
 
 
 @router.delete("/{token}")
 async def delete_session(token: str) -> JSONResponse:
     with write_tx() as conn:
-        cur = conn.execute("DELETE FROM events WHERE token = ?", (token,))
+        conn.execute("DELETE FROM events WHERE token = ?", (token,))
+        conn.execute("DELETE FROM idempotency_keys WHERE token = ?", (token,))
         cur2 = conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
     if cur2.rowcount == 0:
         return JSONResponse(status_code=404, content={"error": "session_not_found", "token": token})

@@ -92,6 +92,9 @@ def _build_response(result: SimResult):
     response.headers["X-Sim-State"] = (
         f"{result.matched['from_state']}->{result.matched['to_state']}"
     )
+    if result.replayed:
+        # 幂等回放：该响应是首个成功请求的落库副本，未重新渲染/迁移
+        response.headers["X-Sim-Idempotent-Replay"] = "true"
     return response
 
 

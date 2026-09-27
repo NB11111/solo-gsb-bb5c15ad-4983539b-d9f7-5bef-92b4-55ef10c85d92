@@ -375,6 +375,11 @@ async def delete_scenario(name: str, request: Request) -> JSONResponse:
         return _not_found(name)
     if force:
         conn.execute("DELETE FROM events WHERE scenario = ?", (name,))
+        conn.execute(
+            "DELETE FROM idempotency_keys WHERE token IN"
+            " (SELECT token FROM sessions WHERE scenario = ?)",
+            (name,),
+        )
         conn.execute("DELETE FROM sessions WHERE scenario = ?", (name,))
         conn.commit()
     store.delete(name)

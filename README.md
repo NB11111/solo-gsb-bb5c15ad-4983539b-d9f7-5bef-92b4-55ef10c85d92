@@ -48,6 +48,14 @@ YAML 场景，服务按**会话令牌**隔离每个调用方的当前状态，�
 `id` 即行 id，浏览器 `EventSource` 断连重连自动续传；空闲时发送心跳，非法游标
 返回 `422`。
 
+业务请求支持**会话级幂等回放**：客户端在请求头携带 `sim-idempotency-key` 后，
+首个成功命中规则的请求把「请求指纹 + 响应」随状态迁移与事件在**同一个
+SQLite 写事务**中落库；同一 token/key 且指纹相同的重试直接返回首个响应——
+不再渲染、不推进状态、不新增事件（响应带 `X-Sim-Idempotent-Replay: true`）；
+指纹不同返回 `409 idempotency_key_conflict`。指纹由方法、路径、查询参数、
+请求体与场景 `when` 中声明的 `header` 匹配字段构成；重置或删除会话会清除
+该 token 的幂等记录，fork 的新 token 不继承记录，不带 key 的请求行为不变。
+
 - 技术栈：Python 3.12 · FastAPI · SQLite（WAL）· Jinja2 沙箱模板 · PyYAML
 - 容器内启动即自动完成依赖安装与数据库初始化（含旧库就地升级），并自动加载 `scenarios/` 下的示例场景
 
@@ -126,6 +134,7 @@ curl -s -X POST $BASE/__sessions/t2/advance \
 - `X-Sim-Matched: order-flow:pay-order:pay-created`（场景:路由:规则）
 - `X-Sim-Revision: 1`（实际执行的场景 revision）
 - `X-Sim-State: created->paid`（迁移前后状态）
+- `X-Sim-Idempotent-Replay: true`（仅幂等回放响应；见下文「幂等回放」）
 
 ---
 
@@ -526,8 +535,8 @@ curl -s -X POST $BASE/__scenarios/analyze \
 | POST | `/__sessions/{token}/fork` | **会话快照分支**：单写事务内复制源会话绑定的 revision、state、context、seq、随机序列位置与虚拟时钟（clock_ms/timeout_at_ms）到新 token（可指定目标 token，冲突 409；源不存在 404；绑定版本已卸载 410）；事件历史不复制，分支后两条会话独立推进 |
 | POST | `/__sessions/{token}/preview` | **请求预演**：不落库地试运行一次业务请求，返回拟响应与 state/context 差异（按会话绑定的 revision 执行） |
 | POST | `/__sessions/{token}/preview/chain` | **连续请求链预演**：有序请求数组基于同一会话快照依次试跑（最多 50 步），逐步返回命中/拟响应/差异与最终快照，不落库 |
-| POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态、虚拟时钟归零并清空事件；不改变会话绑定的 revision；可传 `"seed"` 让随机序列从头初始化 |
-| DELETE | `/__sessions/{token}` | 删除会话及其事件 |
+| POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态、虚拟时钟归零并清空事件与该 token 的幂等回放记录；不改变会话绑定的 revision；可传 `"seed"` 让随机序列从头初始化 |
+| DELETE | `/__sessions/{token}` | 删除会话及其事件与幂等回放记录 |
 
 #### 可复现随机序列（seed）
 
@@ -910,10 +919,57 @@ curl -s -X POST $BASE/__sessions/c1/preview/chain \
 当已载入多个场景时，懒创建需通过请求头 `sim-scenario: <name>` 指定场景
 （或设置环境变量 `SIM_DEFAULT_SCENARIO`）。
 
+#### 幂等回放（sim-idempotency-key）
+
+联调与重试场景下，客户端在业务请求头携带 `sim-idempotency-key: <key>` 即可获得
+**会话级 exactly-once 语义**：同一 token 下同一 key 只真正执行一次。
+
+- **首次命中即落库**：第一个携带 key 且成功命中规则的请求，把请求指纹
+  （方法、路径、查询参数、请求体，以及场景 `when` 中 `source: header` 声明的
+  匹配字段取值）与响应（状态码、响应头、响应体）随状态迁移、事件在**同一个
+  SQLite 写事务**中保存；未命中规则（409 `no_matching_rule`）、路由不存在
+  （404）或渲染失败（500）都不留记录，修正后用同一 key 重试仍会真正执行；
+- **相同指纹重试 = 回放**：同 token/key 且指纹相同的后续请求直接返回首个
+  响应（含 `X-Sim-Matched`/`X-Sim-State` 等调试头，另加
+  `X-Sim-Idempotent-Replay: true`），**不再渲染模板、不推进状态、不消耗
+  `seq()`/随机序列、不新增事件**，也不重新施加 `delay_ms`；未在场景条件中
+  声明的请求头（如链路追踪头）不参与指纹，改变它们不影响回放；
+- **指纹不同 = 409**：同 token/key 但方法/路径/查询参数/请求体/已声明 header
+  任一不同，返回 `409 idempotency_key_conflict`，不会误执行；
+- **记录生命周期**：`POST /__sessions/{token}/reset` 与
+  `DELETE /__sessions/{token}` 会清除该 token 的全部幂等记录；
+  `fork` 出的新 token **不继承**源会话的记录（各自独立）；
+- 不携带 key 的请求行为与之前完全一致（每次都真正执行）。
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 首次下单：201，init -> created，响应随指纹落库
+curl -s -X POST $BASE/orders \
+  -H 'sim-session-token: t1' -H 'sim-idempotency-key: create-order-1' \
+  -H 'Content-Type: application/json' -d '{"sku":"A-1","quantity":2}'
+
+# 2) 网络重试（同 token/key、同请求成分）：返回首个响应，
+#    带 X-Sim-Idempotent-Replay: true，不重复创建订单、不新增事件
+curl -s -i -X POST $BASE/orders \
+  -H 'sim-session-token: t1' -H 'sim-idempotency-key: create-order-1' \
+  -H 'Content-Type: application/json' -d '{"sku":"A-1","quantity":2}'
+
+# 3) 同 key 但请求体不同：409 idempotency_key_conflict
+curl -s -X POST $BASE/orders \
+  -H 'sim-session-token: t1' -H 'sim-idempotency-key: create-order-1' \
+  -H 'Content-Type: application/json' -d '{"sku":"A-1","quantity":5}'
+
+# 4) 重置会话后该 token 的幂等记录被清除，同一 key 可重新使用
+curl -s -X POST $BASE/__sessions/t1/reset \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
 ### 业务请求约定
 
 - 会话令牌：请求头 `sim-session-token: <token>`（也支持 `?sim_session_token=`）。
 - 可选请求头 `sim-scenario: <name>`：仅新会话首次请求时用于绑定场景。
+- 可选请求头 `sim-idempotency-key: <key>`：会话级幂等回放（见上文）。
 - 请求体：`application/json` 按 JSON 解析；`application/x-www-form-urlencoded`
   按表单解析；YAML 的 content-type 按 YAML 解析；其他文本保存为 `body._raw`。
 
@@ -1048,7 +1104,7 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 │   ├── models.py          # 场景/路由/规则/状态超时数据模型
 │   ├── matching.py        # 路径模式、点路径取值、条件运算符
 │   ├── renderer.py        # Jinja2 沙箱渲染、模板函数与会话级确定性随机源（seed）
-│   ├── engine.py          # 核心：单事务匹配→渲染→迁移；虚拟时钟 advance 超时连续结算；同快照只读预演（零副作用）；两 revision 纯内存版本回归对比
+│   ├── engine.py          # 核心：单事务匹配→渲染→迁移；幂等回放（指纹+首响应随事务落库）；虚拟时钟 advance 超时连续结算；同快照只读预演（零副作用）；两 revision 纯内存版本回归对比
 │   ├── event_bus.py       # 进程内事件总线：写事务提交后唤醒 SSE 订阅者（单 worker 权威）
 │   ├── store.py           # 已编译场景缓存（按 name+revision）、发布/激活
 │   └── routers/
@@ -1068,10 +1124,13 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 revision/状态/上下文/虚拟时钟 `clock_ms`/当前状态超时到期时刻 `timeout_at_ms`；
 上下文内含 `_seq` 计数器与 `_rng` 随机序列状态）、
 `events`（每次命中的 revision、路由、规则、前后状态与状态码；超时迁移记为
-`method=ADVANCE`、`route=@timeout`、`rule=timeout:<from>`、`status_code=NULL`）。
+`method=ADVANCE`、`route=@timeout`、`rule=timeout:<from>`、`status_code=NULL`）、
+`idempotency_keys`（会话级幂等回放记录：`(token, idem_key)` 主键，请求指纹 +
+首个响应的状态码/响应头/响应体，随状态迁移在同一写事务落库；重置/删除会话时
+清除，fork 不继承）。
 启动时自动检测并就地升级旧版表结构：旧定义固化为 revision 1，既有会话回填绑定
-该版本、虚拟时钟归零，历史事件的 revision 置空。随机序列状态存于上下文 JSON
-内部，无需表结构变更，既有会话不受影响。
+该版本、虚拟时钟归零，历史事件的 revision 置空；`idempotency_keys` 等新表随启动
+自动创建。随机序列状态存于上下文 JSON 内部，无需表结构变更，既有会话不受影响。
 
 ---
 
